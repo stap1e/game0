@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>五子棋强化学习训练系统 (RL-Gobang)</title>
+    <style>
+        :root {
+            --bg-color: #1e1e1e;
+            --panel-color: #2d2d2d;
+            --text-color: #e0e0e0;
+            --accent-color: #4CAF50;
+            --board-bg: #e6b380;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            flex-direction: row;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        #game-area {
+            flex: 2;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: #121212;
+            position: relative;
+        }
+
+        canvas {
+            background-color: var(--board-bg);
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            cursor: crosshair;
+            border-radius: 4px;
+        }
+
+        #sidebar {
+            flex: 1;
+            background-color: var(--panel-color);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            border-left: 1px solid #444;
+            overflow-y: auto;
+        }
+
+        h2 { margin-top: 0; border-bottom: 1px solid #555; padding-bottom: 10px; }
+        
+        .stat-box {
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .weights-display {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+
+        .weight-row {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .bar-container {
+            width: 100px;
+            height: 10px;
+            background: #444;
+            margin-left: 10px;
+            position: relative;
+        }
+        .bar-fill {
+            height: 100%;
+            background: var(--accent-color);
+            transition: width 0.2s;
+        }
+
+        button {
+            padding: 12px;
+            background-color: var(--accent-color);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #45a049; }
+        button.stop { background-color: #f44336; }
+        button:disabled { background-color: #555; cursor: not-allowed; }
+
+        #log {
+            flex: 1;
+            background: #000;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 12px;
+            overflow-y: auto;
+            border: 1px solid #444;
+            color: #0f0;
+        }
+
+        .toggle-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-area">
+    <canvas id="board" width="600" height="600"></canvas>
+</div>
+
+<div id="sidebar">
+    <h2>RL 训练控制台</h2>
+    
+    <div class="stat-box">
+        <div>状态: <span id="status-text" style="color: #4CAF50">准备就绪</span></div>
+        <div>训练局数: <span id="episode-count">0</span></div>
+        <div>当前胜率 (最近50局): <span id="win-rate">0%</span></div>
+        <div>Epsilon (探索率): <span id="epsilon-val">0.2</span></div>
+    </div>
+
+    <div class="toggle-group">
+        <button id="btn-train-start">开始极速训练 (Self-Play)</button>
+        <button id="btn-train-stop" class="stop" disabled>停止</button>
+    </div>
+    <button id="btn-play-ai">人机对战 (测试模型)</button>
+    <button id="btn-reset">重置权重</button>
+
+    <h3>特征权重 (Weights)</h3>
+    <div id="weights-container" class="weights-display stat-box">
+        <!-- 权重将通过 JS 动态生成 -->
+    </div>
+
+    <h3>训练日志</h3>
+    <div id="log"></div>
+</div>
+
+<script>
+/**
+ * 五子棋强化学习核心逻辑
+ * 作者: 资深游戏开发专家
+ */
+
+// --- 常量定义 ---
+const BOARD_SIZE = 15;
+const CELL_SIZE = 40;
+const EMPTY = 0;
+const BLACK = 1;
+const WHITE = 2;
+
+// 特征定义 (基于模式匹配)
+const FEATURES = {
+    'WIN5': { pattern: '11111', initial: 10000 },
+    'LIVE4': { pattern: '011110', initial: 300 },
+    'DEAD4': { pattern: '11110', initial: 50 },  // 也包含 01111
+    'LIVE3': { pattern: '01110', initial: 50 },
+    'DEAD3': { pattern: '11100', initial: 10 },
+    'LIVE2': { pattern: '01100', initial: 5 },
+    'DEAD2': { pattern: '11000', initial: 1 }
+};
+
+// 全局变量
+let board = [];
+let ctx = document.getElementById('board').getContext('2d');
+let isTraining = false;
+let trainingInterval = null;
+let episodes = 0;
+let winHistory = []; // 记录最近胜负 1=BlackWin, 0=WhiteWin
+let weights = {};
+let epsilon = 0.2; // 探索率
+let learningRate = 0.01;
+let isHumanPlaying = false;
+let humanTurn = false; // 人类执黑
+
+// --- 初始化 ---
+function init() {
+    initBoard();
+    initWeights();
+    drawBoard();
+    renderWeights();
+    log("系统初始化完成。请点击“开始极速训练”来训练AI。");
+}
+
+function initBoard() {
+    board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(EMPTY));
+}
+
+function initWeights() {
+    for (let key in FEATURES) {
+        weights[key] = FEATURES[key].initial;
+    }
+}
+
+// --- 绘图逻辑 ---
+function drawBoard() {
+    // 清空
+    ctx.fillStyle = '#e6b380';
+    ctx.fillRect(0, 0, 600, 600);
+
+    // 网格
+    ctx.beginPath();
+    ctx.strokeStyle = '#000';
+    for (let i = 0; i < BOARD_SIZE; i++) {
+        // 横线
+        ctx.moveTo(20, 20 + i * CELL_SIZE);
+        ctx.lineTo(580, 20 + i * CELL_SIZE);
+        // 竖线
+        ctx.moveTo(20 + i * CELL_SIZE, 20);
+        ctx.lineTo(20 + i * CELL_SIZE, 580);
+    }
+    ctx.stroke();
+
+    // 棋子
+    for (let y = 0; y < BOARD_SIZE; y++) {
+        for (let x = 0; x < BOARD_SIZE; x++) {
+            if (board[y][x] !== EMPTY) {
+                drawPiece(x, y, board[y][x]);
+            }
+        }
+    }
+    
+    // 标记最后一步
+    if (lastMove) {
+        ctx.fillStyle = 'red';
+        ctx.beginPath();
+        ctx.arc(20 + lastMove.x * CELL_SIZE, 20 + lastMove.y * CELL_SIZE, 3, 0, 2 * Math.PI);
+        ctx.fill();
+    }
+}
+
+function drawPiece(x, y, color) {
+    ctx.beginPath();
+    ctx.arc(20 + x * CELL_SIZE, 20 + y * CELL_SIZE, 18, 0, 2 * Math.PI);
+    ctx.fillStyle = color === BLACK ? '#000' : '#fff';
+    ctx.fill();
+    if (color === WHITE) {
+        ctx.strokeStyle = '#ccc';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+}
+
+// --- 核心 AI 逻辑 (特征提取与评估) ---
+
+// 将棋盘特定方向转换为字符串，用于正则匹配
+// player: 当前评估的玩家颜色
+function getLineString(x, y, dx, dy, player) {
+    let str = "";
+    // 向前取4个，向后取4个，组成长度9的探测窗口
+    for (let k = -4; k <= 4; k++) {
+        let nx = x + k * dx;
+        let ny = y + k * dy;
+        if (nx < 0 || nx >= BOARD_SIZE || ny < 0 || ny >= BOARD_SIZE) {
+            str += "X"; // 边界
+        } else {
+            let val = board[ny][nx];
+            if (val === EMPTY) str += "0";
+            else if (val === player) str += "1";
+            else str += "2"; // 敌方
+        }
+    }
+    return str;
+}
+
+/**
+ * 全局局势评估函数 (Leaf Node Evaluator)
+ * 利用强化学习训练出来的 weights 来评估当前局面对 maxPlayer 的优势
+ * 返回值：正数代表 maxPlayer 优势，负数代表 minPlayer 优势
+ */
+function evaluateBoardState(maxPlayer) {
+    let score = 0;
+    let minPlayer = maxPlayer === BLACK ? WHITE : BLACK;
+
+    // 扫描整个棋盘的特征分
+    // 为了性能，我们只扫描有子区域的线
+    // 这里简化为：评估双方的总“特征分”之差
+    
+    // 获取当前玩家的总分
+    score += getPlayerBoardScore(maxPlayer);
+    // 减去对手的总分 (系数 1.2 表示略微更重视防守/压制)
+    score -= getPlayerBoardScore(minPlayer) * 1.0; 
+
+    return score;
+}
+
+// 辅助：计算某一方在当前棋盘的总特征分
+function getPlayerBoardScore(player) {
+    let totalScore = 0;
+    const directions = [[1,0], [0,1], [1,1], [1,-1]];
+    
+    // 这是一个简化版的扫描，为了性能不进行全盘每个点扫描
+    // 实际项目中可以维护一个增量分值
+    // 这里我们遍历所有非空点，只计算该点作为起点的线，避免重复太严重
+    
+    // 为了不卡顿，我们只做“局部模式匹配”，复用之前的思路
+    // 遍历所有该玩家的棋子
+    for (let y = 0; y < BOARD_SIZE; y++) {
+        for (let x = 0; x < BOARD_SIZE; x++) {
+            if (board[y][x] === player) {
+                for (let d of directions) {
+                    // 为了避免一条线上的棋子重复计算多次特征，我们限制一下
+                    // 比如只在特征的“头部”计算，但这比较复杂。
+                    // 这里采用简单粗暴的采样：取该点为中心的 9 格串
+                    let str = getLineString(x, y, d[0], d[1], player);
+                    for (let key in FEATURES) {
+                        if (str.includes(FEATURES[key].pattern)) {
+                            totalScore += weights[key];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return totalScore;
+}
+
+/**
+ * Minimax 算法主函数
+ * @param {number} depth 当前深度
+ * @param {number} alpha Alpha 值 (Max 玩家的下限)
+ * @param {number} beta Beta 值 (Min 玩家的上限)
+ * @param {boolean} isMaximizing 是否是最大化玩家 (AI)
+ * @param {number} player 当前模拟下子的颜色
+ */
+function minimax(depth, alpha, beta, isMaximizing, player) {
+    // 1. 检查游戏结束 (Win/Loss)
+    // 注意：这里的 checkWin 需要传入上一步的位置，这里简化处理，
+    // 实际应该在递归传参中带上 lastMove。为了代码简洁，我们假设 evaluateBoardState 能反映出巨大的胜利分数。
+    // 如果上一层导致了胜利，我们应该在上一层就截断，或者在这里通过分数判断。
+    
+    // 2. 到达叶子节点或深度耗尽
+    if (depth === 0) {
+        // 评估函数：站在 AI (Maximizing) 的角度看当前局面
+        let aiColor = isMaximizing ? player : (player === BLACK ? WHITE : BLACK);
+        return evaluateBoardState(aiColor); 
+    }
+
+    let moves = getNeighborMoves(1); // 获取候选步
+    
+    // --- 关键优化：Move Ordering (启发式排序) ---
+    // 先搜索“看起来”分高的步，能更快触发剪枝
+    // 利用原来的 evaluatePosition (单步评估) 来做排序
+    moves.sort((a, b) => {
+        // 注意：这里用简单的单步评估来排序，不改变 board
+        // 这是一个轻量级的预估
+        let scoreA = evaluatePositionPure(a.x, a.y, player);
+        let scoreB = evaluatePositionPure(b.x, b.y, player);
+        return scoreB - scoreA; // 降序
+    });
+    // 只取前 15-20 个最好的步数进行深搜，防止广度爆炸
+    if (moves.length > 20) moves = moves.slice(0, 20);
+
+
+    if (isMaximizing) {
+        let maxEval = -Infinity;
+        for (let move of moves) {
+            board[move.y][move.x] = player; // 模拟落子
+            
+            // 检查这一步是否直接赢了？如果赢了直接返回超级高分
+            if (checkWin(move.x, move.y, player)) {
+                board[move.y][move.x] = EMPTY; // 撤销
+                return 100000 + depth; // 加上 depth 让 AI 倾向于更快赢
+            }
+
+            let opponent = player === BLACK ? WHITE : BLACK;
+            let evalVal = minimax(depth - 1, alpha, beta, false, opponent);
+            
+            board[move.y][move.x] = EMPTY; // 撤销落子 (Backtrack)
+            
+            maxEval = Math.max(maxEval, evalVal);
+            alpha = Math.max(alpha, evalVal);
+            if (beta <= alpha) break; // Alpha-Beta 剪枝
+        }
+        return maxEval;
+    } else {
+        let minEval = Infinity;
+        for (let move of moves) {
+            board[move.y][move.x] = player;
+            
+            // 检查这一步是否对手赢了？
+            if (checkWin(move.x, move.y, player)) {
+                board[move.y][move.x] = EMPTY;
+                return -100000 - depth; // 对手赢了，对 AI 来说是超级低分
+            }
+
+            let opponent = player === BLACK ? WHITE : BLACK;
+            let evalVal = minimax(depth - 1, alpha, beta, true, opponent);
+            
+            board[move.y][move.x] = EMPTY;
+            
+            minEval = Math.min(minEval, evalVal);
+            beta = Math.min(beta, evalVal);
+            if (beta <= alpha) break; // Alpha-Beta 剪枝
+        }
+        return minEval;
+    }
+}
+
+// 纯净版的单步评估（仅用于 Move Ordering 排序，不修改全局）
+function evaluatePositionPure(x, y, player) {
+    let score = 0;
+    const directions = [[1,0], [0,1], [1,1], [1,-1]];
+    // 简单的攻击分
+    for (let d of directions) {
+        let str = getLineString(x, y, d[0], d[1], player); // 注意：这里需要修改 getLineString 让他包含 board[y][x] 假设为 player
+        // 由于 getLineString 读取的是 board，我们这里其实不需要改 board，
+        // 而是手动拼接字符串，或者为了简单，我们在 sort 前就把 board 改了再改回来？
+        // 鉴于 JS 性能，我们这里简化：
+        // 直接复用原来的逻辑，因为 board 还没下子，我们假设下了：
+    }
+    // 为了简单，Move Ordering 我们直接用简单的距离+随机，或者依赖外层的 sort
+    // 这里我们稍微 hack 一下：暂时在 board 上下子，算完回退
+    board[y][x] = player;
+    for (let d of directions) {
+        let str = getLineString(x, y, d[0], d[1], player);
+        for (let key in FEATURES) {
+            if (str.includes(FEATURES[key].pattern)) score += weights[key];
+        }
+    }
+    board[y][x] = EMPTY;
+    return score;
+}
+
+
+// --- 新的入口函数 ---
+
+function getBestMove(player) {
+    // 1. 如果是训练模式 (Self-Play)，为了速度，依然使用原来的贪心+随机
+    if (isTraining) {
+        return getBestMoveGreedy(player); 
+    }
+
+    // 2. 如果是人机对战，使用 Minimax
+    // 第一步依然走天元或附近
+    let existingPieces = 0;
+    for(let r of board) for(let c of r) if(c!==EMPTY) existingPieces++;
+    if (existingPieces === 0) return {x: 7, y: 7};
+
+    let moves = getNeighborMoves(1);
+    
+    // 第一层：根节点搜索
+    let bestScore = -Infinity;
+    let bestMove = null;
+    let alpha = -Infinity;
+    let beta = Infinity;
+
+    // 根节点也进行一次排序，把好棋排前面
+    moves.sort((a, b) => evaluatePositionPure(b.x, b.y, player) - evaluatePositionPure(a.x, a.y, player));
+    // 截取前 15 个候选，避免思考太久
+    if (moves.length > 15) moves = moves.slice(0, 15);
+
+    for (let move of moves) {
+        board[move.y][move.x] = player;
+        
+        if (checkWin(move.x, move.y, player)) {
+            board[move.y][move.x] = EMPTY;
+            return move; // 必胜棋直接走
+        }
+
+        let opponent = player === BLACK ? WHITE : BLACK;
+        // 递归开始：下一层是对手 (Minizing Player)
+        // 深度：SEARCH_DEPTH - 1
+        let score = minimax(SEARCH_DEPTH - 1, alpha, beta, false, opponent);
+        
+        board[move.y][move.x] = EMPTY;
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestMove = move;
+        }
+        // 更新 alpha
+        alpha = Math.max(alpha, score);
+    }
+
+    // 如果没找到（比如所有步都会输），随机走一步防止报错
+    return bestMove || moves[0];
+}
+
+// 原来的贪心算法，改名为 getBestMoveGreedy 供训练时使用
+function getBestMoveGreedy(player) {
+    if (Math.random() < epsilon) {
+        let emptySpots = [];
+        for(let y=0; y<BOARD_SIZE; y++) 
+            for(let x=0; x<BOARD_SIZE; x++) 
+                if(board[y][x] === EMPTY) emptySpots.push({x, y});
+        if (emptySpots.length > 0) return emptySpots[Math.floor(Math.random() * emptySpots.length)];
+    }
+
+    let bestScore = -Infinity;
+    let bestMoves = [];
+    
+    // 简单优化：只搜局部
+    let candidates = getNeighborMoves(1);
+    if (candidates.length === 0) return {x: 7, y: 7}; // 第一步
+
+    candidates.forEach(move => {
+        let score = evaluatePosition(move.x, move.y, player); // 这里的 evaluatePosition 指原来代码中的函数
+        if (score > bestScore) {
+            bestScore = score;
+            bestMoves = [move];
+        } else if (score === bestScore) {
+            bestMoves.push(move);
+        }
+    });
+
+    return bestMoves[Math.floor(Math.random() * bestMoves.length)];
+}
+
+// --- 注意：请确保上面的代码替换了原来的 getBestMove --- 
+// 同时保留原来 evaluatePosition 函数供 Greedy 使用
+
+const SEARCH_DEPTH = 4; // 搜索深度：2=看一步，4=看两步(一来一回)。建议设置 2 或 4。JS单线程建议不要超过 4。
+
+/**
+ * 获取棋盘上所有已存在棋子周围的空位 (局部搜索优化)
+ * 减少搜索分支，只关注有棋子的地方
+ */
+function getNeighborMoves(distance = 1) {
+    let moves = new Set();
+    for (let y = 0; y < BOARD_SIZE; y++) {
+        for (let x = 0; x < BOARD_SIZE; x++) {
+            if (board[y][x] !== EMPTY) {
+                for (let dy = -distance; dy <= distance; dy++) {
+                    for (let dx = -distance; dx <= distance; dx++) {
+                        let ny = y + dy, nx = x + dx;
+                        if (nx >= 0 && nx < BOARD_SIZE && ny >= 0 && ny < BOARD_SIZE && board[ny][nx] === EMPTY) {
+                            moves.add(`${nx},${ny}`);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 如果棋盘是空的（第一步），返回天元
+    if (moves.size === 0) return [{x: 7, y: 7}];
+    
+    return Array.from(moves).map(str => {
+        let [x, y] = str.split(',').map(Number);
+        return {x, y};
+    });
+}
+
+// --- 游戏流程与训练 ---
+
+let lastMove = null;
+
+function checkWin(x, y, player) {
+    const directions = [[1,0], [0,1], [1,1], [1,-1]];
+    for (let d of directions) {
+        let count = 1;
+        // 正向
+        for (let k=1; k<5; k++) {
+            let nx = x + k*d[0], ny = y + k*d[1];
+            if(nx<0||nx>=BOARD_SIZE||ny<0||ny>=BOARD_SIZE||board[ny][nx]!==player) break;
+            count++;
+        }
+        // 反向
+        for (let k=1; k<5; k++) {
+            let nx = x - k*d[0], ny = y - k*d[1];
+            if(nx<0||nx>=BOARD_SIZE||ny<0||ny>=BOARD_SIZE||board[ny][nx]!==player) break;
+            count++;
+        }
+        if (count >= 5) return true;
+    }
+    return false;
+}
+
+// 训练一局
+function playTrainingGame() {
+    initBoard();
+    let currentPlayer = BLACK;
+    let moves = []; // 记录整局步数：{x, y, player, features_found}
+    let gameOver = false;
+    let winner = 0;
+
+    // 限制步数防止死循环
+    let steps = 0;
+    while (!gameOver && steps < 225) {
+        let move = getBestMove(currentPlayer);
+        if (!move) { gameOver = true; break; } // 平局
+
+        board[move.y][move.x] = currentPlayer;
+        lastMove = move;
+
+        // 记录这一步触发的特征（简化版，用于反向传播）
+        // 实际上应该记录Feature Vector，这里简化处理
+        moves.push({player: currentPlayer, ...move});
+
+        if (checkWin(move.x, move.y, currentPlayer)) {
+            gameOver = true;
+            winner = currentPlayer;
+        } else {
+            currentPlayer = currentPlayer === BLACK ? WHITE : BLACK;
+        }
+        steps++;
+    }
+
+    episodes++;
+    updateStats(winner);
+    
+    // 学习阶段 (Backpropagation of Rewards)
+    // 简单的规则：赢家的关键特征权重增加，输家减少
+    if (winner !== 0) {
+        learnFromGame(moves, winner);
+    }
+    
+    // 每10局绘制一次，避免太闪
+    if (episodes % 10 === 0) {
+        drawBoard();
+        renderWeights();
+    }
+}
+
+function learnFromGame(moves, winner) {
+    // 这是一个非常简化的 Temporal Difference / Monte Carlo 更新
+    // 我们倒序查看，越接近胜利的步数，其特征权重调整越大
+    let decay = 1.0; 
+    for (let i = moves.length - 1; i >= 0; i--) {
+        let move = moves[i];
+        // 如果这步棋是赢家下的
+        let isWinnerMove = (move.player === winner);
+        let rewardSignal = isWinnerMove ? 1 : -1;
+
+        // 重新分析这一步棋当时的特征
+        // 注意：为了简化，我们这里假设当前 board 状态近似于当时
+        // (严格来说应该回滚 board，但那太慢了。我们只取最后的关键几步特征)
+        if (i > moves.length - 10) { // 只关注最后几步
+            adjustWeights(move.x, move.y, move.player, rewardSignal * decay);
+        }
+        decay *= 0.9; // 衰减
+    }
+}
+
+function adjustWeights(x, y, player, signal) {
+    // 检测这一步形成了什么特征，调整该特征权重
+    const directions = [[1,0], [0,1], [1,1], [1,-1]];
+    let adjustedKeys = new Set();
+
+    for (let d of directions) {
+        let str = getLineString(x, y, d[0], d[1], player);
+        for (let key in FEATURES) {
+            if (str.includes(FEATURES[key].pattern) && !adjustedKeys.has(key)) {
+                // 更新公式: W = W + lr * signal
+                // 只有当权重不太离谱时才更新，防止溢出
+                weights[key] += learningRate * signal * 10; 
+                // 保持权重非负
+                if (weights[key] < 0) weights[key] = 0;
+                adjustedKeys.add(key);
+            }
+        }
+    }
+}
+
+function updateStats(winner) {
+    if (winner === BLACK) winHistory.push(1);
+    else if (winner === WHITE) winHistory.push(0);
+    
+    if (winHistory.length > 50) winHistory.shift();
+    
+    let winCount = winHistory.filter(w => w === 1).length;
+    let rate = winHistory.length ? Math.round((winCount / winHistory.length) * 100) : 0;
+    
+    document.getElementById('episode-count').innerText = episodes;
+    document.getElementById('win-rate').innerText = rate + "% (黑棋)";
+    
+    // 随训练减少 epsilon
+    if (episodes % 100 === 0 && epsilon > 0.05) epsilon -= 0.01;
+    document.getElementById('epsilon-val').innerText = epsilon.toFixed(2);
+}
+
+// --- UI 交互 ---
+
+function renderWeights() {
+    let container = document.getElementById('weights-container');
+    container.innerHTML = '';
+    let maxW = Math.max(...Object.values(weights));
+    
+    for (let key in weights) {
+        let w = weights[key];
+        let percent = (w / 15000) * 100; // 归一化显示
+        if (percent > 100) percent = 100;
+        
+        let html = `
+            <div class="weight-row">
+                <span>${key}</span>
+                <span>${Math.round(w)}</span>
+            </div>
+            <div class="bar-container">
+                <div class="bar-fill" style="width: ${percent}%"></div>
+            </div>
+        `;
+        let div = document.createElement('div');
+        div.innerHTML = html;
+        container.appendChild(div);
+    }
+}
+
+function log(msg) {
+    let logDiv = document.getElementById('log');
+    let p = document.createElement('div');
+    p.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logDiv.prepend(p);
+}
+
+// 按钮事件
+document.getElementById('btn-train-start').onclick = () => {
+    if (isHumanPlaying) return;
+    isTraining = true;
+    isHumanPlaying = false;
+    document.getElementById('status-text').innerText = "正在训练 (Self-Play)...";
+    document.getElementById('status-text').style.color = "#FFC107";
+    document.getElementById('btn-train-start').disabled = true;
+    document.getElementById('btn-train-stop').disabled = false;
+    document.getElementById('btn-play-ai').disabled = true;
+    
+    log("开始训练...");
+    trainingInterval = setInterval(playTrainingGame, 10); // 极速
+};
+
+document.getElementById('btn-train-stop').onclick = () => {
+    isTraining = false;
+    clearInterval(trainingInterval);
+    document.getElementById('status-text').innerText = "训练暂停";
+    document.getElementById('status-text').style.color = "#eee";
+    document.getElementById('btn-train-start').disabled = false;
+    document.getElementById('btn-train-stop').disabled = true;
+    document.getElementById('btn-play-ai').disabled = false;
+    log("训练已停止。");
+};
+
+document.getElementById('btn-play-ai').onclick = () => {
+    isTraining = false;
+    clearInterval(trainingInterval);
+    isHumanPlaying = true;
+    humanTurn = true; // 人类执黑先行
+    initBoard();
+    drawBoard();
+    lastMove = null;
+    
+    document.getElementById('status-text').innerText = "人机对战 (你执黑)";
+    document.getElementById('status-text').style.color = "#03A9F4";
+    document.getElementById('btn-train-start').disabled = true;
+    document.getElementById('btn-play-ai').disabled = true;
+    document.getElementById('btn-reset').innerText = "退出对战";
+    log("人机对战开始。请在棋盘上下子。");
+};
+
+document.getElementById('btn-reset').onclick = () => {
+    if (isHumanPlaying) {
+        isHumanPlaying = false;
+        document.getElementById('btn-train-start').disabled = false;
+        document.getElementById('btn-play-ai').disabled = false;
+        document.getElementById('btn-reset').innerText = "重置权重";
+        document.getElementById('status-text').innerText = "准备就绪";
+        return;
+    }
+    initWeights();
+    episodes = 0;
+    winHistory = [];
+    epsilon = 0.2;
+    renderWeights();
+    updateStats(0);
+    log("权重已重置为初始值。");
+};
+
+// 鼠标点击下子 (人机对战)
+document.getElementById('board').onclick = (e) => {
+    if (!isHumanPlaying || !humanTurn) return;
+    
+    let rect = document.getElementById('board').getBoundingClientRect();
+    let x = Math.round((e.clientX - rect.left - 20) / CELL_SIZE);
+    let y = Math.round((e.clientY - rect.top - 20) / CELL_SIZE);
+    
+    if (x < 0 || x >= BOARD_SIZE || y < 0 || y >= BOARD_SIZE) return;
+    if (board[y][x] !== EMPTY) return;
+    
+    // 人类下子
+    board[y][x] = BLACK;
+    lastMove = {x, y};
+    drawBoard();
+    
+    if (checkWin(x, y, BLACK)) {
+        log("你赢了！");
+        alert("你赢了！");
+        isHumanPlaying = false;
+        return;
+    }
+    
+    humanTurn = false;
+    
+    // AI 下子
+    setTimeout(() => {
+        // AI 使用当前训练好的权重
+        let aiMove = getBestMove(WHITE);
+        if (!aiMove) { alert("平局"); return; }
+        
+        board[aiMove.y][aiMove.x] = WHITE;
+        lastMove = aiMove;
+        drawBoard();
+        
+        if (checkWin(aiMove.x, aiMove.y, WHITE)) {
+            log("AI 赢了！");
+            alert("AI 赢了！");
+            isHumanPlaying = false;
+        } else {
+            humanTurn = true;
+        }
+    }, 100);
+};
+
+init();
+
+</script>
+</body>
+</html>
