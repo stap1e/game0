@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neon Striker - Canvas Shooter Demo</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050505;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            user-select: none;
+        }
+
+        canvas {
+            box-shadow: 0 0 50px rgba(0, 255, 255, 0.2);
+            cursor: crosshair;
+        }
+
+        #ui-layer {
+            position: absolute;
+            pointer-events: none;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-shadow: 0 0 10px cyan;
+        }
+
+        .hidden { display: none !important; }
+        
+        h1 { font-size: 3rem; margin: 0; letter-spacing: 5px; text-transform: uppercase; color: #0ff; }
+        p { font-size: 1.2rem; color: #aaa; margin-top: 10px; }
+        .score-board {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #fff;
+            text-align: left;
+        }
+        .controls { font-size: 0.9rem; color: #666; margin-top: 20px; }
+        
+        #start-screen button, #game-over-screen button {
+            margin-top: 30px;
+            padding: 15px 40px;
+            font-size: 1.2rem;
+            background: transparent;
+            color: #0ff;
+            border: 2px solid #0ff;
+            cursor: pointer;
+            transition: all 0.2s;
+            pointer-events: auto;
+            font-weight: bold;
+            text-transform: uppercase;
+            box-shadow: 0 0 10px rgba(0, 255, 255, 0.2);
+        }
+
+        #start-screen button:hover, #game-over-screen button:hover {
+            background: #0ff;
+            color: #000;
+            box-shadow: 0 0 30px rgba(0, 255, 255, 0.8);
+            transform: scale(1.05);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- UI Layer -->
+    <div id="ui-layer">
+        <div class="score-board hidden" id="score-display">
+            SCORE: <span id="score-val">0</span>
+        </div>
+
+        <div id="start-screen">
+            <h1>Neon Striker</h1>
+            <p>极光战机</p>
+            <div class="controls">WASD / 箭头键移动<br>鼠标点击 或 空格键射击</div>
+            <button onclick="game.start()">START MISSION</button>
+        </div>
+
+        <div id="game-over-screen" class="hidden">
+            <h1 style="color: #ff0055">MISSION FAILED</h1>
+            <p>FINAL SCORE: <span id="final-score">0</span></p>
+            <button onclick="game.restart()">RETRY</button>
+        </div>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * 核心游戏引擎逻辑
+ */
+const CANVAS_WIDTH = 600;
+const CANVAS_HEIGHT = 800;
+
+// 颜色常量
+const COLORS = {
+    player: '#00ffff',
+    playerBullet: '#aaffff',
+    enemyBasic: '#ff0055',
+    enemyFast: '#ffaa00',
+    bgStar: '#ffffff',
+    particle: ['#00ffff', '#ff0055', '#ffff00', '#ffffff']
+};
+
+// 工具函数
+const rnd = (min, max) => Math.random() * (max - min) + min;
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const checkCollision = (rect1, rect2) => (
+    rect1.x < rect2.x + rect2.w &&
+    rect1.x + rect1.w > rect2.x &&
+    rect1.y < rect2.y + rect2.h &&
+    rect1.y + rect1.h > rect2.y
+);
+
+class Game {
+    constructor() {
+        this.canvas = document.getElementById('gameCanvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.ui = {
+            start: document.getElementById('start-screen'),
+            gameOver: document.getElementById('game-over-screen'),
+            score: document.getElementById('score-display'),
+            scoreVal: document.getElementById('score-val'),
+            finalScore: document.getElementById('final-score')
+        };
+        
+        // 适配高分屏
+        this.dpr = window.devicePixelRatio || 1;
+        this.canvas.width = CANVAS_WIDTH * this.dpr;
+        this.canvas.height = CANVAS_HEIGHT * this.dpr;
+        this.canvas.style.width = `${CANVAS_WIDTH}px`;
+        this.canvas.style.height = `${CANVAS_HEIGHT}px`;
+        this.ctx.scale(this.dpr, this.dpr);
+
+        this.state = 'MENU'; // MENU, PLAYING, GAMEOVER
+        this.score = 0;
+        this.frames = 0;
+        this.shake = 0;
+
+        // 实体容器
+        this.player = null;
+        this.bullets = [];
+        this.enemies = [];
+        this.particles = [];
+        this.stars = [];
+
+        // 输入状态
+        this.keys = {};
+        this.mouse = { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2, isDown: false };
+
+        this.initInput();
+        this.initStars();
+        this.loop = this.loop.bind(this);
+        requestAnimationFrame(this.loop);
+    }
+
+    initInput() {
+        window.addEventListener('keydown', e => this.keys[e.code] = true);
+        window.addEventListener('keyup', e => {
+            this.keys[e.code] = false;
+            if (e.code === 'Space' && this.state === 'PLAYING') this.player.shooting = false;
+        });
+
+        this.canvas.addEventListener('mousemove', e => {
+            const rect = this.canvas.getBoundingClientRect();
+            this.mouse.x = e.clientX - rect.left;
+            this.mouse.y = e.clientY - rect.top;
+        });
+        this.canvas.addEventListener('mousedown', () => this.mouse.isDown = true);
+        this.canvas.addEventListener('mouseup', () => this.mouse.isDown = false);
+    }
+
+    initStars() {
+        for (let i = 0; i < 100; i++) {
+            this.stars.push({
+                x: rnd(0, CANVAS_WIDTH),
+                y: rnd(0, CANVAS_HEIGHT),
+                size: rnd(0.5, 2),
+                speed: rnd(0.5, 3),
+                alpha: rnd(0.1, 0.8)
+            });
+        }
+    }
+
+    start() {
+        this.resetGame();
+        this.ui.start.classList.add('hidden');
+        this.ui.score.classList.remove('hidden');
+        this.state = 'PLAYING';
+    }
+
+    restart() {
+        this.resetGame();
+        this.ui.gameOver.classList.add('hidden');
+        this.ui.score.classList.remove('hidden');
+        this.state = 'PLAYING';
+    }
+
+    resetGame() {
+        this.player = new Player(this);
+        this.bullets = [];
+        this.enemies = [];
+        this.particles = [];
+        this.score = 0;
+        this.frames = 0;
+        this.shake = 0;
+        this.updateScore();
+    }
+
+    gameOver() {
+        this.state = 'GAMEOVER';
+        this.ui.score.classList.add('hidden');
+        this.ui.gameOver.classList.remove('hidden');
+        this.ui.finalScore.innerText = this.score;
+        
+        // 死亡特效
+        for(let i=0; i<50; i++) {
+            this.spawnParticle(this.player.x + this.player.w/2, this.player.y + this.player.h/2, COLORS.player);
+        }
+        this.shake = 20;
+    }
+
+    updateScore(val = 0) {
+        this.score += val;
+        this.ui.scoreVal.innerText = this.score;
+    }
+
+    spawnParticle(x, y, color, count = 1) {
+        for(let i=0; i<count; i++) {
+            this.particles.push(new Particle(x, y, color));
+        }
+    }
+
+    loop() {
+        // 1. Update Logic
+        if (this.state === 'PLAYING') {
+            this.frames++;
+            this.updateEntities();
+            this.checkCollisions();
+            this.spawnEnemies();
+        }
+        
+        // Always update background/particles even in game over for visual flow
+        this.updateBackground();
+        this.updateParticles();
+
+        // 2. Draw Render
+        this.draw();
+
+        // 3. Screen Shake Decay
+        if (this.shake > 0) this.shake *= 0.9;
+        if (this.shake < 0.5) this.shake = 0;
+
+        requestAnimationFrame(this.loop);
+    }
+
+    updateEntities() {
+        this.player.update();
+        
+        // Update Bullets
+        this.bullets.forEach(b => b.update());
+        this.bullets = this.bullets.filter(b => !b.markedForDeletion);
+
+        // Update Enemies
+        this.enemies.forEach(e => e.update());
+        this.enemies = this.enemies.filter(e => !e.markedForDeletion);
+    }
+
+    updateBackground() {
+        this.stars.forEach(star => {
+            star.y += star.speed + (this.state === 'PLAYING' ? 2 : 0.5); // Warp speed when playing
+            if (star.y > CANVAS_HEIGHT) {
+                star.y = 0;
+                star.x = rnd(0, CANVAS_WIDTH);
+            }
+        });
+    }
+
+    updateParticles() {
+        this.particles.forEach(p => p.update());
+        this.particles = this.particles.filter(p => !p.markedForDeletion);
+    }
+
+    spawnEnemies() {
+        // Difficulty scaling
+        let spawnRate = 60;
+        if (this.score > 1000) spawnRate = 45;
+        if (this.score > 3000) spawnRate = 30;
+
+        if (this.frames % spawnRate === 0) {
+            const type = Math.random() > 0.8 ? 'fast' : 'basic';
+            this.enemies.push(new Enemy(this, type));
+        }
+    }
+
+    checkCollisions() {
+        // Bullets hit Enemies
+        this.bullets.forEach(bullet => {
+            this.enemies.forEach(enemy => {
+                if (checkCollision(bullet, enemy)) {
+                    bullet.markedForDeletion = true;
+                    enemy.hit();
+                    this.spawnParticle(bullet.x, bullet.y, COLORS.playerBullet, 3);
+                }
+            });
+        });
+
+        // Enemies hit Player
+        this.enemies.forEach(enemy => {
+            // Simple hitbox reduction for player to be forgiving
+            const playerHitbox = {
+                x: this.player.x + 10,
+                y: this.player.y + 10,
+                w: this.player.w - 20,
+                h: this.player.h - 20
+            };
+            
+            if (checkCollision(enemy, playerHitbox)) {
+                this.gameOver();
+            }
+        });
+    }
+
+    draw() {
+        // Clear Screen with slight trail effect for "neon" vibe (optional, sticking to clean clear for performance)
+        this.ctx.fillStyle = '#050505';
+        this.ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+        // Apply Screen Shake
+        this.ctx.save();
+        if (this.shake > 0) {
+            this.ctx.translate(rnd(-this.shake, this.shake), rnd(-this.shake, this.shake));
+        }
+
+        // Draw Stars
+        this.ctx.fillStyle = '#ffffff';
+        this.stars.forEach(star => {
+            this.ctx.globalAlpha = star.alpha;
+            this.ctx.fillRect(star.x, star.y, star.size, star.size);
+        });
+        this.ctx.globalAlpha = 1.0;
+
+        // Draw Entities
+        // Use 'lighter' composite for neon glow stacking
+        this.ctx.globalCompositeOperation = 'lighter';
+
+        if (this.state === 'PLAYING' || this.state === 'GAMEOVER') {
+            this.bullets.forEach(b => b.draw(this.ctx));
+            this.particles.forEach(p => p.draw(this.ctx));
+            this.enemies.forEach(e => e.draw(this.ctx));
+        }
+
+        if (this.state === 'PLAYING') {
+            this.player.draw(this.ctx);
+        }
+
+        this.ctx.globalCompositeOperation = 'source-over';
+        this.ctx.restore();
+    }
+}
+
+class Player {
+    constructor(game) {
+        this.game = game;
+        this.w = 40;
+        this.h = 40;
+        this.x = CANVAS_WIDTH / 2 - this.w / 2;
+        this.y = CANVAS_HEIGHT - 100;
+        this.vx = 0;
+        this.vy = 0;
+        this.speed = 6;
+        this.friction = 0.15; // 滑动感
+        
+        this.lastShot = 0;
+        this.shootDelay = 8; // 射速
+    }
+
+    update() {
+        // Movement Logic (WASD + Arrow)
+        let ax = 0;
+        let ay = 0;
+
+        if (this.game.keys['ArrowLeft'] || this.game.keys['KeyA']) ax = -1;
+        if (this.game.keys['ArrowRight'] || this.game.keys['KeyD']) ax = 1;
+        if (this.game.keys['ArrowUp'] || this.game.keys['KeyW']) ay = -1;
+        if (this.game.keys['ArrowDown'] || this.game.keys['KeyS']) ay = 1;
+
+        // Mouse control override if mouse is down
+        if (this.game.mouse.isDown) {
+            // Simple follow with lerp
+            const targetX = this.game.mouse.x - this.w/2;
+            const targetY = this.game.mouse.y - this.h/2;
+            this.x += (targetX - this.x) * 0.2;
+            this.y += (targetY - this.y) * 0.2;
+        } else {
+            // Acceleration
+            if (ax !== 0) this.vx += ax * 1.5;
+            if (ay !== 0) this.vy += ay * 1.5;
+
+            // Friction
+            this.vx *= (1 - this.friction);
+            this.vy *= (1 - this.friction);
+
+            // Cap speed
+            this.vx = clamp(this.vx, -this.speed * 1.5, this.speed * 1.5);
+            this.vy = clamp(this.vy, -this.speed * 1.5, this.speed * 1.5);
+
+            this.x += this.vx;
+            this.y += this.vy;
+        }
+
+        // Screen Boundaries
+        this.x = clamp(this.x, 0, CANVAS_WIDTH - this.w);
+        this.y = clamp(this.y, 0, CANVAS_HEIGHT - this.h);
+
+        // Shooting
+        if (this.game.keys['Space'] || this.game.mouse.isDown) {
+            if (this.game.frames - this.lastShot > this.shootDelay) {
+                this.shoot();
+            }
+        }
+    }
+
+    shoot() {
+        this.lastShot = this.game.frames;
+        // 双发
+        this.game.bullets.push(new Bullet(this.x, this.y, 0, -15));
+        this.game.bullets.push(new Bullet(this.x + this.w - 6, this.y, 0, -15));
+        
+        // 散布射击 (当分数高时)
+        if (this.game.score > 500) {
+            this.game.bullets.push(new Bullet(this.x + this.w/2, this.y + 10, -2, -14));
+            this.game.bullets.push(new Bullet(this.x + this.w/2, this.y + 10, 2, -14));
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x + this.w/2, this.y + this.h/2);
+        
+        // Tilt effect based on velocity
+        ctx.rotate(this.vx * 0.05);
+
+        // Glow
+        ctx.shadowBlur = 20;
+        ctx.shadowColor = COLORS.player;
+
+        // Ship Body (Simple Triangle)
+        ctx.fillStyle = COLORS.player;
+        ctx.beginPath();
+        ctx.moveTo(0, -this.h/2);
+        ctx.lineTo(this.w/2, this.h/2);
+        ctx.lineTo(0, this.h/4);
+        ctx.lineTo(-this.w/2, this.h/2);
+        ctx.closePath();
+        ctx.fill();
+
+        // Engine Thruster
+        ctx.shadowBlur = 10;
+        ctx.fillStyle = '#fff';
+        const thrust = Math.random() * 10;
+        ctx.beginPath();
+        ctx.moveTo(-5, this.h/4);
+        ctx.lineTo(5, this.h/4);
+        ctx.lineTo(0, this.h/2 + 10 + thrust);
+        ctx.fill();
+
+        ctx.restore();
+    }
+}
+
+class Bullet {
+    constructor(x, y, vx, vy) {
+        this.x = x;
+        this.y = y;
+        this.w = 6;
+        this.h = 20;
+        this.vx = vx;
+        this.vy = vy;
+        this.markedForDeletion = false;
+    }
+
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        if (this.y < -50 || this.y > CANVAS_HEIGHT + 50) {
+            this.markedForDeletion = true;
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = COLORS.playerBullet;
+        ctx.fillStyle = COLORS.playerBullet;
+        ctx.fillRect(this.x, this.y, this.w, this.h);
+        ctx.restore();
+    }
+}
+
+class Enemy {
+    constructor(game, type) {
+        this.game = game;
+        this.type = type;
+        this.w = 40;
+        this.h = 40;
+        this.x = rnd(20, CANVAS_WIDTH - 60);
+        this.y = -60;
+        this.markedForDeletion = false;
+        this.flash = 0;
+
+        if (type === 'basic') {
+            this.hp = 3;
+            this.vy = rnd(2, 4);
+            this.vx = rnd(-0.5, 0.5);
+            this.color = COLORS.enemyBasic;
+            this.scoreVal = 100;
+        } else if (type === 'fast') {
+            this.w = 30;
+            this.h = 30;
+            this.hp = 1;
+            this.vy = rnd(5, 8);
+            this.vx = rnd(-1, 1);
+            this.color = COLORS.enemyFast;
+            this.scoreVal = 200;
+        }
+    }
+
+    update() {
+        this.y += this.vy;
+        this.x += this.vx;
+
+        // Sine wave movement for basic
+        if (this.type === 'basic') {
+            this.x += Math.sin(this.game.frames * 0.05) * 1.5;
+        }
+
+        this.x = clamp(this.x, 0, CANVAS_WIDTH - this.w);
+
+        if (this.y > CANVAS_HEIGHT) {
+            this.markedForDeletion = true;
+        }
+        if (this.flash > 0) this.flash--;
+    }
+
+    hit() {
+        this.hp--;
+        this.flash = 3;
+        if (this.hp <= 0) {
+            this.markedForDeletion = true;
+            this.game.updateScore(this.scoreVal);
+            this.game.shake = 5;
+            this.game.spawnParticle(this.x + this.w/2, this.y + this.h/2, this.color, 10);
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = this.color;
+        
+        if (this.flash > 0) {
+            ctx.fillStyle = '#fff';
+            ctx.shadowBlur = 20;
+        } else {
+            ctx.fillStyle = this.color;
+        }
+
+        // Draw Enemy Shape
+        ctx.translate(this.x + this.w/2, this.y + this.h/2);
+        ctx.rotate(Math.PI); // Face down
+        
+        if (this.type === 'basic') {
+            // Boxy shape
+            ctx.fillRect(-this.w/2, -this.h/2, this.w, this.h);
+            // Eyes
+            ctx.fillStyle = '#000';
+            ctx.fillRect(-10, -10, 5, 15);
+            ctx.fillRect(5, -10, 5, 15);
+        } else {
+            // Triangle shape
+            ctx.beginPath();
+            ctx.moveTo(0, -this.h/2 - 10);
+            ctx.lineTo(this.w/2, this.h/2);
+            ctx.lineTo(-this.w/2, this.h/2);
+            ctx.closePath();
+            ctx.fill();
+        }
+        ctx.restore();
+    }
+}
+
+class Particle {
+    constructor(x, y, color) {
+        this.x = x;
+        this.y = y;
+        this.size = rnd(3, 8);
+        const angle = rnd(0, Math.PI * 2);
+        const speed = rnd(1, 6);
+        this.vx = Math.cos(angle) * speed;
+        this.vy = Math.sin(angle) * speed;
+        this.life = 1.0;
+        this.decay = rnd(0.02, 0.05);
+        this.color = color;
+        this.markedForDeletion = false;
+    }
+
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.vx *= 0.95; // Friction
+        this.vy *= 0.95;
+        this.life -= this.decay;
+        this.size *= 0.95;
+
+        if (this.life <= 0 || this.size <= 0.1) {
+            this.markedForDeletion = true;
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.globalAlpha = this.life;
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+}
+
+// 启动游戏实例
+const game = new Game();
+
+</script>
+</body>
+</html>
